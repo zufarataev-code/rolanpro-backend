@@ -202,3 +202,93 @@ app.put('/api/state', requireApiKey, (req, res) => {
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 app.listen(PORT, () => console.log(`RolanPRO backend listening on port ${PORT}`));
+
+
+// =====================================================================
+// AI SALES BOT — обученный на продукте RolanPRO чат-бот для сайта.
+// - CRM загружает базу знаний:  PUT /api/ai/knowledge  (защищено API_KEY)
+// - Виджет на сайте общается:   POST /api/ai/chat      (публичный)
+// - Ключ Anthropic живёт здесь, в env (ANTHROPIC_API_KEY) — на сайте не светится.
+// =====================================================================
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const AI_MODEL = process.env.AI_MODEL || 'claude-sonnet-4-6';
+const KNOWLEDGE_FILE = path.join(DATA_DIR, 'knowledge.json');
+if (!fs.existsSync(KNOWLEDGE_FILE)) fs.writeFileSync(KNOWLEDGE_FILE, JSON.stringify({ text: '' }));
+
+app.put('/api/ai/knowledge', requireApiKey, (req, res) => {
+  const text = (req.body && req.body.text) || '';
+  writeJSON(KNOWLEDGE_FILE, { text, updatedAt: new Date().toISOString() })
+    .then(() => res.json({ ok: true, chars: text.length }));
+});
+app.get('/api/ai/knowledge', requireApiKey, (req, res) => {
+  res.json(readJSON(KNOWLEDGE_FILE));
+});
+
+// Простейшая защита от злоупотреблений: лимит запросов с одного IP
+const chatHits = new Map();
+function chatRateLimited(ip) {
+  const now = Date.now();
+  const rec = chatHits.get(ip) || [];
+  const fresh = rec.filter(t => now - t < 60 * 60 * 1000); // за час
+  fresh.push(now);
+  chatHits.set(ip, fresh);
+  return fresh.length > 60; // максимум 60 сообщений в час с IP
+}
+
+app.post('/api/ai/chat', async (req, res) => {
+  try {
+    if (!ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI не настроен (нет ANTHROPIC_API_KEY)' });
+    const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || '?';
+    if (chatRateLimited(ip)) return res.status(429).json({ error: 'Слишком много сообщений, попробуйте позже' });
+
+    const history = Array.isArray(req.body.messages) ? req.body.messages.slice(-20) : [];
+    const messages = history
+      .filter(m => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+      .map(m => ({ role: m.role, content: m.content.slice(0, 2000) }));
+    if (!messages.length || messages[messages.length - 1].role !== 'user') {
+      return res.status(400).json({ error: 'messages должен заканчиваться сообщением user' });
+    }
+
+    const knowledge = readJSON(KNOWLEDGE_FILE).text || '';
+    const system = `Ты — дружелюбный консультант компании RolanPRO (установка оконных плёнок в Лос-Анджелесе: солнцезащитные, защитные/security, smart, декоративные, приватные).
+Твоя задача: помочь посетителю, ответить на вопросы о плёнках, мягко подвести к бесплатной консультации/замеру и получить имя и телефон.
+Правила: отвечай кратко (2-4 предложения), на языке клиента (обычно английский или русский), не выдумывай цены точнее, чем указано в базе знаний, не обещай сроков без данных. Если клиент готов — попроси имя и телефон и скажи, что менеджер свяжется в течение 15 минут в рабочее время.
+Если вопрос совсем не по теме окон/плёнок/компании — вежливо вернись к теме.
+
+БАЗА ЗНАНИЙ О ПРОДУКТЕ:
+${knowledge || '(база знаний пока не загружена — отвечай общими сведениями об оконных плёнках и предлагай консультацию)'}`;
+
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({ model: AI_MODEL, max_tokens: 500, system, messages }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) return res.status(502).json({ error: data.error?.message || 'AI error' });
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+
+    const allUserText = messages.filter(m => m.role === 'user').map(m => m.content).join(' ');
+    const phoneMatch = allUserText.match(/(\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})/);
+    let leadCreated = false;
+    if (phoneMatch && !req.body.leadAlreadyCreated) {
+      const nameGuess = (req.body.visitorName || '').slice(0, 80);
+      await addLead({
+        source: 'ai-chat',
+        name: nameGuess,
+        phone: phoneMatch[1],
+        email: '',
+        message: 'Из ИИ-чата: ' + allUserText.slice(-300),
+      });
+      leadCreated = true;
+    }
+
+    res.json({ reply: text, leadCreated });
+  } catch (err) {
+    console.error('AI chat error:', err);
+    res.status(500).json({ error: 'internal' });
+  }
+});
