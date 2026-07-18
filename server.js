@@ -292,3 +292,28 @@ ${knowledge || '(база знаний пока не загружена — от
     res.status(500).json({ error: 'internal' });
   }
 });
+
+
+// =====================================================================
+// SMS PROXY — браузер не может звать textbelt.com напрямую (CORS),
+// поэтому CRM шлёт SMS через этот эндпоинт, а сервер — в TextBelt.
+// Ключ TextBelt передаётся из CRM (или задаётся в env TEXTBELT_KEY).
+// =====================================================================
+app.post('/api/sms/send', requireApiKey, async (req, res) => {
+  try {
+    const { to, message, textbeltKey } = req.body || {};
+    if (!to || !message) return res.status(400).json({ error: 'Нужны to и message' });
+    const key = textbeltKey || process.env.TEXTBELT_KEY || '';
+    if (!key) return res.status(400).json({ error: 'Нет TextBelt ключа' });
+    const r = await fetch('https://textbelt.com/text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ phone: to, message, key }).toString(),
+    });
+    const data = await r.json();
+    res.json(data);
+  } catch (err) {
+    console.error('SMS proxy error:', err);
+    res.status(502).json({ error: 'proxy: ' + err.message });
+  }
+});
